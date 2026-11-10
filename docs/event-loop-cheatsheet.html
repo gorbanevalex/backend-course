@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Event loop в Node.js: шпаргалка</title>
+<style>
+:root{--s1:#f5f4ef;--s2:#ffffff;--b:#e3e1d9;--bs:#c9c6bb;--tp:#1f1e1b;--ts:#5f5e5a;--tm:#888780;--ba:#e6f1fb;--ta:#0c447c;--bda:#378add;--bw:#faeeda;--tw:#633806;--bdw:#ba7517;--r:8px;--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+@media (prefers-color-scheme:dark){:root{--s1:#262624;--s2:#1c1c1a;--b:#3a3936;--bs:#55534e;--tp:#ecebe6;--ts:#b4b2a9;--tm:#888780;--ba:#0c2a47;--ta:#b5d4f4;--bda:#378add;--bw:#3b2a10;--tw:#fac775;--bdw:#ba7517}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--s2);color:var(--tp);font:16px/1.65 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+main{max-width:760px;margin:0 auto;padding:32px 20px 64px}
+h1{font-size:26px;font-weight:600;margin:0 0 6px}
+h2{font-size:19px;font-weight:600;margin:36px 0 12px}
+.sub{color:var(--ts);margin:0 0 8px}
+code{font-family:var(--mono);font-size:.9em;background:var(--s1);padding:1px 5px;border-radius:4px}
+table{width:100%;border-collapse:collapse;font-size:15px}
+th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--b)}
+th{color:var(--ts);font-weight:500;font-size:13px}
+.model{display:grid;gap:10px}
+.model div{border:1px solid var(--b);border-radius:var(--r);padding:12px 14px;background:var(--s1)}
+.model b{display:block;margin-bottom:2px}
+.rule{margin-top:12px;padding:10px 14px;border-left:3px solid var(--bdw);background:var(--bw);color:var(--tw);font-size:15px}
+.ph{flex:1;padding:7px 2px;border:1px solid var(--bs);border-radius:var(--r);text-align:center;font-size:13px;color:var(--ts);background:var(--s1)}
+.ph.on{background:var(--ba);color:var(--ta);border-color:var(--bda);font-weight:600}
+.bx{border:1px solid var(--b);border-radius:var(--r);padding:8px;background:var(--s1);min-height:64px}
+.bx.cur{border-color:var(--bda);background:var(--ba)}
+.bx.mi{border-color:var(--bdw)}
+.bt{font-size:12px;color:var(--tm);margin-bottom:6px}
+.ch{display:inline-block;font-family:var(--mono);font-size:12px;padding:2px 6px;margin:2px;border-radius:4px;border:1px solid var(--bs);background:var(--s2);color:var(--tp)}
+.empty{font-size:12px;color:var(--tm)}
+.code{border:1px solid var(--b);border-radius:var(--r);padding:6px 0;background:var(--s1);overflow-x:auto}
+.ln{font-family:var(--mono);font-size:13px;padding:1px 10px;color:var(--ts);white-space:pre}
+.ln.on{background:var(--ba);color:var(--ta)}
+.g3{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:10px}
+.g4{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:8px}
+@media (max-width:600px){.g3,.g4{grid-template-columns:1fr 1fr}}
+.desc{margin-top:12px;font-size:15px;min-height:76px}
+.nav{display:flex;justify-content:space-between;align-items:center;margin-top:8px}
+button{padding:7px 16px;border:1px solid var(--bs);border-radius:var(--r);background:var(--s1);color:var(--tp);cursor:pointer;font-size:14px}
+button:hover{border-color:var(--tm)}
+ul{padding-left:20px}
+li{margin:6px 0}
+</style>
+</head>
+<body>
+<main>
+<h1>Event loop в Node.js</h1>
+<p class="sub">Шпаргалка к модулю 0: модель, фазы и пошаговый прогон примера.</p>
+
+<h2>Модель в трёх блоках</h2>
+<div class="model">
+<div><b>Один JS-поток</b>Весь твой JavaScript выполняется в одном потоке, общем для всех запросов. Колбэк выполняется до конца (run-to-completion), прервать его нельзя.</div>
+<div><b>libuv: поллер ОС + пул потоков</b>Сеть (HTTP, БД, Redis) идёт через поллер ОС, без потоков. Файлы, <code>dns.lookup</code>, часть <code>crypto</code> и <code>zlib</code> идут в пул (по умолчанию 4 потока, <code>UV_THREADPOOL_SIZE</code>). Результат всегда возвращается колбэком в JS-поток.</div>
+<div><b>Loop — круг из четырёх очередей</b>timers → poll → check → close → снова timers. В каждой фазе выполняется то, что готово в её очереди, потом loop едет дальше. Назад не возвращается.</div>
+</div>
+<div class="rule">После <b>каждого</b> колбэка в любой фазе: сначала все <code>process.nextTick</code>, потом все промисы, до дна. Только потом loop двигается дальше.</div>
+
+<h2>Какой колбэк в какой фазе</h2>
+<table>
+<tr><th>Что за колбэк</th><th>Где выполняется</th></tr>
+<tr><td>Код файла при запуске</td><td>ещё до loop</td></tr>
+<tr><td><code>setTimeout</code> / <code>setInterval</code></td><td>timers</td></tr>
+<tr><td>I/O: <code>readFile</code>, входящий HTTP-запрос, ответ БД</td><td>poll</td></tr>
+<tr><td><code>setImmediate</code></td><td>check</td></tr>
+<tr><td><code>'close'</code>-события</td><td>close</td></tr>
+<tr><td><code>nextTick</code> и промисы</td><td>не фаза: после каждого колбэка выше</td></tr>
+</table>
+
+<h2>Пошаговый прогон</h2>
+<div class="code" id="code"></div>
+<div id="phs" style="display:flex;gap:4px;margin-top:12px"></div>
+<div class="g3">
+<div class="bx"><div class="bt">Сейчас выполняется</div><div id="run"></div></div>
+<div class="bx mi"><div class="bt">Микрозадачи (nextTick → промисы)</div><div id="mi"></div></div>
+<div class="bx"><div class="bt">Консоль</div><div id="out"></div></div>
+</div>
+<div class="g4">
+<div class="bx" id="b1"><div class="bt">Очередь timers</div><div id="tm"></div></div>
+<div class="bx" id="b2"><div class="bt">Очередь poll (I/O)</div><div id="pl"></div></div>
+<div class="bx" id="b3"><div class="bt">Очередь check</div><div id="ck"></div></div>
+<div class="bx"><div class="bt">Пул потоков libuv</div><div id="tp"></div></div>
+</div>
+<div class="desc" id="d"></div>
+<div class="nav">
+<button onclick="go(-1)">← Назад</button>
+<span class="empty" id="n"></span>
+<button onclick="go(1)">Дальше →</button>
+</div>
+
+<h2>Главные выводы</h2>
+<ul>
+<li><code>setTimeout(fn, 0)</code> означает «на ближайшей фазе timers», а не «сейчас». Если loop уже проехал timers на этом круге, колбэк ждёт следующего круга.</li>
+<li>Микрозадачи выполняются раньше любой следующей фазы. Бесконечная цепочка промисов или <code>nextTick</code> вешает сервер так же, как <code>while</code>.</li>
+<li>Пока выполняется синхронный код, круг стоит. Поэтому тяжёлая CPU-работа в обработчике тормозит всех клиентов.</li>
+<li>Процесс живёт, пока loop'у есть чем заниматься: таймеры, открытые сокеты, задачи в пуле. <code>server.listen()</code> держит сокет открытым, поэтому сервер не завершается.</li>
+</ul>
+</main>
+<script>
+const CODE=["import { readFile } from 'node:fs';","","readFile(import.meta.filename, () => {","  setTimeout(() => console.log('timeout'), 0);","  setImmediate(() => console.log('immediate'));","  process.nextTick(() => console.log('nextTick'));","  Promise.resolve().then(() => console.log('promise'));","  console.log('sync');","});"];
+const P=['старт скрипта','timers','poll','check','close','выход'];
+const steps=[
+{ph:0,ln:2,run:'главный модуль',tp:['чтение файла'],d:'Node выполняет файл сверху вниз, event loop ещё не крутится. readFile отправляет чтение файла в пул потоков и сразу возвращает управление. Больше в файле ничего нет.'},
+{ph:1,ln:-1,run:'',d:'Скрипт закончился, стек пуст. Стартует event loop, круг 1. Фаза timers: таймеров никто не создавал, очередь пуста, едем дальше.'},
+{ph:2,d:'Фаза poll: в очереди I/O пусто. Loop засыпает и ждёт сигнала от ОС. Тем временем поток пула читает файл.'},
+{tp:[],pl:['колбэк readFile'],d:'Файл прочитан. Поток пула сообщает loop’у, колбэк readFile попадает в очередь poll.'},
+{ln:2,run:'колбэк readFile',pl:[],d:'Loop достаёт колбэк из очереди poll и выполняет его. Мы в фазе poll, потому что это колбэк I/O.'},
+{ln:3,tm:['timeout'],d:'setTimeout ничего не выводит: он только кладёт колбэк в очередь timers. Фазу timers на этом круге loop уже проехал.'},
+{ln:4,ck:['immediate'],d:'setImmediate кладёт колбэк в очередь check, это следующая остановка после poll.'},
+{ln:5,mi:['nextTick'],d:'process.nextTick кладёт колбэк в микрозадачи.'},
+{ln:6,mi:['nextTick','promise'],d:'then тоже кладёт колбэк в микрозадачи, после nextTick.'},
+{ln:7,out:['sync'],d:'console.log — обычный синхронный код, выполняется сразу.'},
+{ln:5,run:'микрозадача nextTick',mi:['promise'],out:['sync','nextTick'],d:'Колбэк readFile закончился. До перехода к любой следующей фазе выгребаем микрозадачи: сначала nextTick…'},
+{ln:6,run:'микрозадача promise',mi:[],out:['sync','nextTick','promise'],d:'…потом промисы. Микрозадачи пусты, в poll больше ничего нет, едем по кругу дальше.'},
+{ph:3,ln:4,run:'колбэк setImmediate',ck:[],out:['sync','nextTick','promise','immediate'],d:'Фаза check: выполняем колбэк setImmediate. После него снова проверяются микрозадачи, но их нет.'},
+{ph:4,ln:-1,run:'',d:'Фаза close: пусто. Круг 1 закончен.'},
+{ph:1,ln:3,run:'колбэк setTimeout',tm:[],out:['sync','nextTick','promise','immediate','timeout'],d:'Круг 2, фаза timers. Время таймера вышло, и loop как раз здесь, значит выполняем колбэк.'},
+{ph:5,ln:-1,run:'',d:'Очереди пусты, нет таймеров, открытых сокетов и задач в пуле. Loop’у нечем заниматься, и процесс завершается. Сервер с server.listen() сюда не дойдёт: открытый сокет держит loop живым.'}];
+const S=[];let cur={ph:0,ln:-1,run:'',tm:[],pl:[],ck:[],mi:[],tp:[],out:[],d:''};
+steps.forEach(s=>{cur=Object.assign({},cur,s);S.push(cur)});
+let i=0;
+const esc=t=>t.replace(/&/g,'&amp;').replace(/</g,'&lt;');
+function chips(a){return a.length?a.map(x=>'<span class="ch">'+esc(x)+'</span>').join(''):'<span class="empty">пусто</span>'}
+function go(k){i=Math.min(S.length-1,Math.max(0,i+k));r()}
+function r(){const s=S[i];
+document.getElementById('code').innerHTML=CODE.map((l,j)=>'<div class="ln'+(j===s.ln?' on':'')+'">'+(esc(l)||' ')+'</div>').join('');
+document.getElementById('phs').innerHTML=P.map((p,j)=>'<div class="ph'+(j===s.ph?' on':'')+'">'+p+'</div>').join('');
+document.getElementById('run').innerHTML=s.run?'<span class="ch">'+esc(s.run)+'</span>':'<span class="empty">стек пуст</span>';
+['tm','pl','ck','mi','tp','out'].forEach(k=>document.getElementById(k).innerHTML=chips(s[k]));
+[1,2,3].forEach(j=>document.getElementById('b'+j).classList.toggle('cur',s.ph===j));
+document.getElementById('d').textContent=s.d;
+document.getElementById('n').textContent=(i+1)+' / '+S.length}
+document.addEventListener('keydown',e=>{if(e.key==='ArrowRight')go(1);if(e.key==='ArrowLeft')go(-1)});
+r();
+</script>
+</body>
+</html>
